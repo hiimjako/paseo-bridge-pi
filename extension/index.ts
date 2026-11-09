@@ -17,7 +17,9 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { completeSimple } from "@earendil-works/pi-ai";
+import { sessionPaths, claimOwner, canonicalSession } from "../shim/session-owner.js";
+import { openPaseoClient, paseoHome } from "./paseo-client.js";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // Markers and command names must match Paseo's pi adapter
@@ -27,18 +29,6 @@ const COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
 const CAPTURE_COMMAND = "paseo_capture_entries";
 const TREE_COMMAND = "paseo_tree";
 
-// Keep in sync with shim/pi-paseo-shim.js (pipePathForSession).
-function pipePathForSession(sessionFile: string): string {
-  let normalized = path.resolve(sessionFile);
-  if (process.platform === "win32") normalized = normalized.toLowerCase();
-  const hash = crypto.createHash("sha256").update(normalized).digest("hex").slice(0, 20);
-  if (process.platform === "win32") return `\\\\.\\pipe\\pi-paseo-bridge-${hash}`;
-  const dir = process.env.XDG_RUNTIME_DIR
-    ? path.join(process.env.XDG_RUNTIME_DIR, "pi-paseo")
-    : path.join(os.homedir(), ".pi", "paseo-bridge");
-  return path.join(dir, `${hash}.sock`);
-}
-
 const DEBUG = ["1", "true", "on"].includes((process.env.PI_PASEO_BRIDGE_DEBUG ?? "").toLowerCase());
 const debugLogFile = path.join(os.homedir(), ".pi", "paseo-bridge", "debug.log");
 
@@ -46,7 +36,7 @@ function debugLog(message: string): void {
   if (!DEBUG) return;
   try {
     fs.mkdirSync(path.dirname(debugLogFile), { recursive: true });
-    fs.appendFileSync(debugLogFile, `${new Date().toISOString()} ${message}\n`);
+    fs.appendFileSync(debugLogFile, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 });
   } catch {
     // never let logging break the TUI
   }
@@ -83,7 +73,7 @@ function bridgeShimPath(): string {
   return path.join(path.dirname(here), "shim", "pi-paseo-shim.js");
 }
 
-const paseoConfigFile = path.join(os.homedir(), ".paseo", "config.json");
+const paseoConfigFile = path.join(paseoHome(), "config.json");
 
 function isOurShimCommand(command: unknown): boolean {
   return (
@@ -213,7 +203,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
   let server: net.Server | null = null;
   let client: net.Socket | null = null;
   let currentSessionFile: string | null = null;
-  let currentPipePath: string | null = null;
+  let releaseOwner: (() => void) | null = null;
   let latestCtx: ExtensionContext | null = null;
   let isCompacting = false;
   let autoCompactionEnabled = true;
@@ -225,151 +215,40 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
   let remoteAppliedThinking: string | null = null;
   let titleAttempted = false;
 
-  function paseoWsUrl(): string | null {
-    const host = process.env.PASEO_HOST?.trim();
-    if (!host) return "ws://127.0.0.1:6767/ws";
-    if (host.includes("://")) return null; // relay/offer URLs not supported for state sync
-    return `ws://${host}/ws`;
-  }
-
-  // The daemon hides non-legacy providers (including pi) from clients that
-  // do not declare a recent app version in their hello.
-  const PASEO_CLIENT_APP_VERSION = "0.1.110";
-
-  // Opens a connection to the Paseo daemon's WS API (hello handshake, then
-  // session-wrapped request/response correlated by requestId). Used for
-  // state the daemon only accepts as client requests (it caches
-  // model/thinking/titles and prefers the cache over anything visible
-  // through the provider RPC surface).
-  function openPaseoWs(): { request: (build: (requestId: string) => Record<string, unknown>) => Promise<any>; close: () => void } | null {
-    const url = paseoWsUrl();
-    if (!url) return null;
-    const WebSocketCtor = (globalThis as any).WebSocket;
-    if (typeof WebSocketCtor !== "function") {
-      debugLog("global WebSocket unavailable; cannot sync state to Paseo");
-      return null;
-    }
-    const ws = new WebSocketCtor(url);
-    const pending = new Map<string, (payload: any) => void>();
-    debugLog(`paseo sync websocket connecting to ${url}`);
-    const opened = new Promise<void>((resolve, reject) => {
-      ws.onopen = () => {
-        debugLog("paseo sync websocket connected");
-        ws.send(
-          JSON.stringify({
-            type: "hello",
-            clientId: `pi-paseo-bridge-${process.pid}`,
-            clientType: "cli",
-            protocolVersion: 1,
-            appVersion: PASEO_CLIENT_APP_VERSION,
-          }),
-        );
-        resolve();
-      };
-      ws.onerror = (event: unknown) => {
-        debugLog(`paseo sync websocket error: ${String((event as any)?.message ?? "connection error")}`);
-        reject(new Error("connection error"));
-      };
-    });
-    opened.catch(() => {}); // avoid unhandled rejection when nothing awaits yet
-    ws.onclose = (event: { code?: unknown; reason?: unknown }) => {
-      debugLog(`paseo sync websocket closed (code=${String(event?.code ?? "unknown")}, reason=${String(event?.reason ?? "none")})`);
-    };
-    ws.onmessage = (event: { data: unknown }) => {
-      try {
-        const msg = JSON.parse(String(event.data));
-        const payload = msg?.type === "session" ? msg.message?.payload : undefined;
-        const resolver = payload?.requestId ? pending.get(payload.requestId) : undefined;
-        if (resolver) {
-          pending.delete(payload.requestId);
-          debugLog(`paseo sync response received for ${payload.requestId}`);
-          resolver(payload);
-        } else if (msg?.type === "session") {
-          debugLog(`paseo sync received uncorrelated session message (requestId=${String(payload?.requestId ?? "none")})`);
-        }
-      } catch {
-        // initial state snapshot or binary frame - ignore
-      }
-    };
-    return {
-      async request(build) {
-        await opened;
-        const requestId = crypto.randomUUID();
-        return await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => {
-            pending.delete(requestId);
-            debugLog(`paseo sync request timed out: ${requestId}`);
-            reject(new Error("timeout"));
-          }, 5000);
-          pending.set(requestId, (payload) => {
-            clearTimeout(timer);
-            resolve(payload);
-          });
-          const message = build(requestId);
-          debugLog(`paseo sync sending ${String(message.type ?? "unknown")} (requestId=${requestId})`);
-          ws.send(JSON.stringify({ type: "session", message }));
-        });
-      },
-      close() {
-        try {
-          ws.close();
-        } catch {
-          // already closed
-        }
-      },
-    };
-  }
-
-  function paseoSessionRequest(buildMessage: (requestId: string) => Record<string, unknown>, label: string): void {
-    const conn = openPaseoWs();
-    if (!conn) return;
-    conn
-      .request(buildMessage)
-      .then((payload) => {
-        const ok = payload.accepted ?? payload.ok;
-        debugLog(`paseo sync ${label}: ${ok ? "accepted" : `rejected: ${payload.error}`}`);
-      })
-      .catch((err) => debugLog(`paseo sync ${label}: ${String(err?.message ?? err)}`))
-      .finally(() => conn.close());
-  }
-
-  // The sidebar labels workspaces by branch name; give the workspace the
-  // session title, prefixed so it's clear the session started in a terminal.
-  async function setPaseoWorkspaceTitle(agentId: string, title: string): Promise<void> {
-    const conn = openPaseoWs();
-    if (!conn) return;
-    const workspaceTitle = `[TUI] ${title}`;
+  // Each operation reconnects/authenticates using current instance credentials.
+  // No raw server errors or frames are logged (they can contain secrets).
+  async function withPaseoClient<T>(operation: (client: DaemonClient) => Promise<T>): Promise<T> {
+    const conn = openPaseoClient();
     try {
-      const fetched = await conn.request((requestId) => ({ type: "fetch_agent_request", agentId, requestId }));
-      const workspaceId = fetched?.agent?.workspaceId;
-      if (!workspaceId) {
-        debugLog(`workspace title: agent ${agentId} has no workspaceId (${fetched?.error ?? "no error"})`);
-        return;
-      }
-      const result = await conn.request((requestId) => ({
-        type: "workspace.title.set.request",
-        workspaceId,
-        title: workspaceTitle,
-        requestId,
-      }));
-      debugLog(`paseo sync workspace title "${workspaceTitle}": ${result.accepted ? "accepted" : `rejected: ${result.error}`}`);
-    } catch (err) {
-      debugLog(`workspace title failed: ${String(err)}`);
+      await conn.connect();
+      return await operation(conn);
     } finally {
-      conn.close();
+      await conn.close();
+    }
+  }
+
+  function syncPaseo(operation: (client: DaemonClient) => Promise<unknown>): void {
+    void withPaseoClient(operation).catch(() => debugLog("Paseo state sync failed; check selected instance/authentication"));
+  }
+
+  async function setPaseoWorkspaceTitle(agentId: string, title: string): Promise<void> {
+    try {
+      await withPaseoClient(async (conn) => {
+        const fetched = await conn.fetchAgent(agentId);
+        const workspaceId = fetched?.agent?.workspaceId;
+        if (workspaceId) await conn.setWorkspaceTitle(workspaceId, `[TUI] ${title}`);
+      });
+    } catch {
+      debugLog("Paseo workspace title sync failed");
     }
   }
 
   function pushAgentConfigToPaseo(kind: "model" | "thinking", value: string | null): void {
     if (!currentAgentId) return;
     const agentId = currentAgentId;
-    paseoSessionRequest(
-      (requestId) =>
-        kind === "model"
-          ? { type: "set_agent_model_request", agentId, modelId: value, requestId }
-          : { type: "set_agent_thinking_request", agentId, thinkingOptionId: value, requestId },
-      `${kind}=${value}`,
-    );
+    syncPaseo((conn) => kind === "model"
+      ? conn.setAgentModel(agentId, value)
+      : conn.setAgentThinkingOption(agentId, value));
   }
 
   function modelToId(model: { provider?: string; id?: string } | null | undefined): string | null {
@@ -486,7 +365,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
       ? [{ type: "text", text: message }, ...cmd.images]
       : message;
     const streaming = latestCtx ? !latestCtx.isIdle() : false;
-    pi.sendUserMessage(content as any, streaming ? { deliverAs: "followUp" } : undefined);
+    pi.sendUserMessage(content as any, { expandPromptTemplates: true, ...(streaming ? { deliverAs: "followUp" as const } : {}) });
     send(success(cmd.id, "prompt", { agentInvoked: true }));
   }
 
@@ -514,8 +393,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
           send(success(id, type, buildState()));
           return;
         case "get_messages": {
-          const entries = latestCtx?.sessionManager.buildContextEntries() ?? [];
-          const messages = entries.filter((e: any) => e.type === "message").map((e: any) => e.message);
+          const messages = latestCtx?.sessionManager.buildSessionProjection().messages ?? [];
           send(success(id, type, { messages }));
           return;
         }
@@ -584,7 +462,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
         try {
           parsed = JSON.parse(line);
         } catch {
-          debugLog(`ignoring non-JSON line from client: ${line.slice(0, 200)}`);
+          debugLog("ignoring non-JSON line from client");
           continue;
         }
         void handleCommand(parsed);
@@ -623,14 +501,10 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
       }
       server = null;
     }
-    if (currentPipePath && process.platform !== "win32") {
-      try {
-        fs.unlinkSync(currentPipePath);
-      } catch {
-        // absent - fine
-      }
+    if (releaseOwner) {
+      releaseOwner();
+      releaseOwner = null;
     }
-    currentPipePath = null;
     currentSessionFile = null;
     currentAgentId = null;
     remoteAppliedModel = null;
@@ -639,15 +513,9 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
   }
 
   function startServer(sessionFile: string): void {
-    const pipePath = pipePathForSession(sessionFile);
-    if (process.platform !== "win32") {
-      fs.mkdirSync(path.dirname(pipePath), { recursive: true, mode: 0o700 });
-      try {
-        fs.unlinkSync(pipePath);
-      } catch {
-        // no stale socket
-      }
-    }
+    const paths = sessionPaths(sessionFile);
+    const release = claimOwner(paths, "terminal");
+    const pipePath = paths.socket;
     const srv = net.createServer((socket) => {
       if (client) {
         try {
@@ -668,28 +536,32 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
       }
       attachClient(socket);
     });
-    srv.on("error", (err) => {
-      debugLog(`server error: ${String(err)}`);
+    srv.on("error", () => {
+      debugLog("bridge server failed");
+      stopServer();
     });
     srv.listen(pipePath, () => {
       if (process.platform !== "win32") {
         try {
           fs.chmodSync(pipePath, 0o600);
         } catch {
-          // best effort
+          debugLog("bridge socket permissions failed");
+          stopServer();
+          return;
         }
       }
+      registerWithPaseo(sessionFile, latestCtx?.cwd ?? process.cwd());
       debugLog(`listening on ${pipePath} for ${sessionFile}`);
     });
     server = srv;
-    currentPipePath = pipePath;
+    releaseOwner = release;
     currentSessionFile = sessionFile;
   }
 
   const agentMapFile = path.join(os.homedir(), ".pi", "paseo-bridge", "agents.json");
 
   function agentMapKey(sessionFile: string): string {
-    const resolved = path.resolve(sessionFile);
+    const resolved = canonicalSession(sessionFile);
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
   }
 
@@ -739,7 +611,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     const runImport = () => {
       const args = ["import", "--provider", "pi", sessionFile, "--cwd", cwd, "--json", ...hostArgs];
       runPaseoCli(cli, args, (code, output) => {
-        debugLog(`paseo import exited ${code}: ${output.slice(0, 500)}`);
+        debugLog(`paseo import exited ${code}`);
         if (code !== 0) return;
         try {
           const jsonStart = output.indexOf("{");
@@ -778,8 +650,8 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
       }
       // The daemon's provider session for this agent died with the previous
       // TUI process; reload restarts it so it reattaches to the new pipe.
-      runPaseoCli(cli, ["agent", "reload", knownAgentId, "--json", ...hostArgs], (reloadCode, reloadOutput) => {
-        debugLog(`paseo agent reload exited ${reloadCode}: ${reloadOutput.slice(0, 200)}`);
+      runPaseoCli(cli, ["agent", "reload", knownAgentId, "--json", ...hostArgs], (reloadCode) => {
+        debugLog(`paseo agent reload exited ${reloadCode}`);
         if (reloadCode === 0) {
           adoptAgent(knownAgentId, true);
         } else {
@@ -797,7 +669,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
       startServer(file);
     }
     importAttempted.delete(file);
-    registerWithPaseo(file, ctx.cwd);
+    if (server?.listening) registerWithPaseo(file, ctx.cwd);
     return "Connecting session to Paseo...";
   }
 
@@ -827,11 +699,14 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     "tool_execution_update",
     "tool_execution_end",
     "agent_end",
+    "agent_settled",
   ] as const;
   for (const eventName of forwardEvents) {
     (pi as any).on(eventName, async (event: unknown, ctx: ExtensionContext) => {
       latestCtx = ctx;
-      send(event);
+      // Extension agent_end omits runtime willRetry. Its presence opts Paseo
+      // into waiting for agent_settled, including retries and queued continuations.
+      send(eventName === "agent_end" ? { ...(event as object), willRetry: false } : event);
     });
   }
 
@@ -846,10 +721,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
       // sure Paseo shows it.
       titleAttempted = true;
       const agentId = currentAgentId;
-      paseoSessionRequest(
-        (requestId) => ({ type: "update_agent_request", agentId, name: existingName, requestId }),
-        `title "${existingName}" (existing)`,
-      );
+      syncPaseo((conn) => conn.updateAgent(agentId, { name: existingName }));
       void setPaseoWorkspaceTitle(agentId, existingName);
       return;
     }
@@ -862,12 +734,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     try {
       const model = ctx.model;
       if (!model) return;
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-      if (!auth.ok) {
-        debugLog(`title generation: no auth: ${auth.error}`);
-        return;
-      }
-      const response = await completeSimple(
+      const response = await ctx.modelRegistry.complete(
         model,
         {
           systemPrompt:
@@ -876,7 +743,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
             { role: "user", content: [{ type: "text", text: firstMessage.slice(0, 4000) }], timestamp: Date.now() } as any,
           ],
         },
-        { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, maxTokens: 1024, reasoning: "off" },
+        { maxTokens: 1024, reasoning: "off" },
       );
       let title = readTextContent(response.content).trim().split("\n")[0].trim().replace(/^["']+|["']+$/g, "");
       if (!title) {
@@ -886,10 +753,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
       if (title.length > 80) title = `${title.slice(0, 77)}...`;
       pi.setSessionName(title);
       const agentId = currentAgentId;
-      paseoSessionRequest(
-        (requestId) => ({ type: "update_agent_request", agentId, name: title, requestId }),
-        `title "${title}"`,
-      );
+      if (agentId) syncPaseo((conn) => conn.updateAgent(agentId, { name: title }));
       if (agentId) void setPaseoWorkspaceTitle(agentId, title);
     } catch (err) {
       debugLog(`title generation failed: ${String(err)}`);

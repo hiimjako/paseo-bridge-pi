@@ -25,9 +25,14 @@
   ],
   "scripts": {
     "dev-install": "node scripts/install.js",
-    "dev-uninstall": "node scripts/uninstall.js"
+    "dev-uninstall": "node scripts/uninstall.js",
+    "test": "node --experimental-strip-types --test test/*.test.js"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.1"
+    "@earendil-works/pi-coding-agent": "1.5.0"
+  },
+  "dependencies": {
+    "@getpaseo/client": "0.15.3",
+    "@getpaseo/protocol": "0.15.3"
   }
 }

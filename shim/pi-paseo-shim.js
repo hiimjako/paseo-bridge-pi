@@ -5,25 +5,12 @@
 // the real pi with unchanged argv so Paseo-native behaviour is preserved.
 import net from "node:net";
 import path from "node:path";
-import os from "node:os";
 import fs from "node:fs";
-import crypto from "node:crypto";
+import { sessionPaths, readOwner, ownerIsDead, claimOwner, privateDirectory } from "./session-owner.js";
 import { spawn } from "node:child_process";
 
 const CONNECT_TIMEOUT_MS = 500;
 const args = process.argv.slice(2);
-
-// Keep in sync with extension/index.ts (pipePathForSession).
-function pipePathForSession(sessionFile) {
-  let normalized = path.resolve(sessionFile);
-  if (process.platform === "win32") normalized = normalized.toLowerCase();
-  const hash = crypto.createHash("sha256").update(normalized).digest("hex").slice(0, 20);
-  if (process.platform === "win32") return `\\\\.\\pipe\\pi-paseo-bridge-${hash}`;
-  const dir = process.env.XDG_RUNTIME_DIR
-    ? path.join(process.env.XDG_RUNTIME_DIR, "pi-paseo")
-    : path.join(os.homedir(), ".pi", "paseo-bridge");
-  return path.join(dir, `${hash}.sock`);
-}
 
 function extractSessionArg(argv) {
   for (let i = 0; i < argv.length; i += 1) {
@@ -149,7 +136,7 @@ function resolveRealPi() {
   return null;
 }
 
-function passthrough() {
+function passthrough(release = () => {}) {
   const real = resolveRealPi();
   if (!real) {
     process.stderr.write(
@@ -158,11 +145,14 @@ function passthrough() {
     process.exit(1);
   }
   const child = spawn(real.command, [...real.prefix, ...args], { stdio: "inherit" });
+  if (child.pid) release.setPid?.(child.pid);
   child.on("error", (err) => {
+    release();
     process.stderr.write(`pi-paseo-shim: failed to spawn real pi: ${err.message}\n`);
     process.exit(1);
   });
   child.on("exit", (code, signal) => {
+    release();
     process.exit(signal ? 1 : (code ?? 1));
   });
 }
@@ -170,22 +160,25 @@ function passthrough() {
 async function main() {
   const sessionFile = extractSessionArg(args);
   if (sessionFile) {
-    const pipePath = pipePathForSession(sessionFile);
-    const socket = await tryConnect(pipePath);
-    if (socket) {
+    const paths = sessionPaths(sessionFile);
+    const owner = readOwner(paths);
+    if (owner?.kind === "terminal") {
+      if (process.platform !== "win32") privateDirectory(path.dirname(paths.socket));
+      if (ownerIsDead(owner)) throw new Error("Terminal session is closed; reopen its TUI explicitly");
+      const socket = await tryConnect(paths.socket);
+      if (!socket) throw new Error("Terminal owner is unavailable; refusing to launch a second writer");
       bridge(socket, sessionFile);
       return;
     }
-    if (process.platform !== "win32") {
-      // A socket file that refuses connections is stale from a crash.
-      try {
-        fs.unlinkSync(pipePath);
-      } catch {
-        // absent or not ours - nothing to clean
-      }
-    }
+    // Only positively native/unadopted sessions may launch real Pi.
+    const release = claimOwner(paths, "native");
+    passthrough(release);
+    return;
   }
   passthrough();
 }
 
-main();
+main().catch(() => {
+  process.stderr.write("pi-paseo-shim: session ownership unavailable. Keep/reopen the terminal TUI; no fallback was started.\n");
+  process.exitCode = 1;
+});

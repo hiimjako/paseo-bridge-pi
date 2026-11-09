@@ -7,7 +7,7 @@ export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 export const extensionDir = norm(path.join(repoRoot, "extension"));
 export const shimPath = norm(path.join(repoRoot, "shim", "pi-paseo-shim.js"));
 export const piSettingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
-export const paseoConfigPath = path.join(os.homedir(), ".paseo", "config.json");
+export const paseoConfigPath = path.join(process.env.PASEO_HOME || path.join(os.homedir(), ".paseo"), "config.json");
 
 export function norm(p) {
   return p.replaceAll("\\", "/");
