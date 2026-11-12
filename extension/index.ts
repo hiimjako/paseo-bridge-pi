@@ -264,6 +264,117 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     }
   }
 
+  type AskResponse = { index: number } | { text: string } | null;
+  type AskRequest = {
+    id: string; question: string; options: { label: string; description?: string }[];
+    signal: AbortSignal; respond: (response: AskResponse) => void;
+  };
+  type PendingAsk = {
+    request: AskRequest; socket: net.Socket; agentId: string;
+    dialogId: string; step: "select" | "input"; options: string[]; abort: () => void;
+  };
+  const pendingAsks = new Map<string, PendingAsk>();
+
+  function retireAsk(pending: PendingAsk): void {
+    pendingAsks.delete(pending.request.id);
+    pending.request.signal.removeEventListener("abort", pending.abort);
+  }
+
+  function cleanAskCard(pending: PendingAsk, response: AskResponse): void {
+    // Capture the originating card/agent before any asynchronous work or step change.
+    const { dialogId, agentId, step, options } = pending;
+    const answer = response === null ? null : step === "select"
+      ? ("index" in response ? options[response.index - 1] : options.at(-1))
+      : ("text" in response ? response.text : pending.request.options[response.index - 1]?.label);
+    void withPaseoClient(async (conn) => {
+      // A local answer can beat the daemon's registration of the just-written frame.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await conn.respondToPermissionAndWait(agentId, dialogId, answer == null
+            ? { behavior: "deny" }
+            : { behavior: "allow", updatedInput: { answers: { Response: answer } } }, 500);
+          return;
+        } catch {
+          if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
+      debugLog("Paseo question cleanup failed");
+    }).catch(() => debugLog("Paseo question cleanup failed"));
+  }
+
+  function dropAsks(socket: net.Socket): void {
+    for (const pending of pendingAsks.values()) {
+      if (pending.socket !== socket) continue;
+      retireAsk(pending);
+      cleanAskCard(pending, null);
+    }
+  }
+
+  function sendAsk(pending: PendingAsk): void {
+    try {
+      pending.socket.write(`${JSON.stringify({
+        type: "extension_ui_request", id: pending.dialogId, method: pending.step,
+        title: pending.request.question,
+        ...(pending.step === "select" ? { options: pending.options } : {}),
+      })}\n`);
+    } catch {
+      retireAsk(pending);
+      cleanAskCard(pending, null);
+      debugLog("Paseo question forwarding failed");
+    }
+  }
+
+  pi.events.on("ask-user:request", (request: AskRequest) => {
+    if (!client || client.destroyed || !client.writable || !currentAgentId || request.signal.aborted) return;
+    if (pendingAsks.has(request.id)) return;
+    const pending: PendingAsk = {
+      request, socket: client, agentId: currentAgentId, dialogId: crypto.randomUUID(), step: "select",
+      options: [...request.options.map((option, index) =>
+        `${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ""}`),
+        `${request.options.length + 1}. Write my own answer…`],
+      abort: () => { retireAsk(pending); cleanAskCard(pending, null); },
+    };
+    pendingAsks.set(request.id, pending);
+    request.signal.addEventListener("abort", pending.abort, { once: true });
+    sendAsk(pending);
+  });
+
+  pi.events.on("ask-user:resolved", (event: { id: string; response: AskResponse }) => {
+    const pending = pendingAsks.get(event.id);
+    if (!pending) return;
+    // Retire before cleanup: daemon replies to cleanup must never answer the tool.
+    retireAsk(pending);
+    cleanAskCard(pending, event.response);
+  });
+
+  function handleAskResponse(cmd: any, socket: net.Socket): void {
+    const pending = [...pendingAsks.values()].find((entry) => entry.dialogId === cmd.id && entry.socket === socket);
+    if (!pending || socket !== client || socket.destroyed || pending.request.signal.aborted) return;
+    let response: AskResponse;
+    if (cmd.cancelled === true) {
+      response = null;
+    } else {
+      if ((cmd.cancelled !== undefined && cmd.cancelled !== false) || typeof cmd.value !== "string") return;
+      if (pending.step === "select") {
+        const index = pending.options.indexOf(cmd.value);
+        if (index < 0) return;
+        if (index === pending.options.length - 1) {
+          pending.step = "input";
+          pending.dialogId = crypto.randomUUID();
+          sendAsk(pending);
+          return;
+        }
+        response = { index: index + 1 };
+      } else {
+        if (!cmd.value.trim()) return;
+        response = { text: cmd.value.trim() };
+      }
+    }
+    retireAsk(pending);
+    try { pending.request.respond(response); }
+    catch { debugLog("Paseo question response failed"); }
+  }
+
   function notifyTui(message: string): void {
     if (latestCtx?.mode !== "tui") return;
     try {
@@ -369,7 +480,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     send(success(cmd.id, "prompt", { agentInvoked: true }));
   }
 
-  async function handleCommand(cmd: any): Promise<void> {
+  async function handleCommand(cmd: any, socket: net.Socket): Promise<void> {
     const id = cmd.id;
     const type: string = cmd.type;
     try {
@@ -435,10 +546,11 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
           send(success(id, type));
           return;
         case "extension_ui_response":
-          // v1: extension UI dialogs render in the TUI only; nothing pending here.
+          handleAskResponse(cmd, socket);
           return;
         default:
-          send(failure(id, type ?? "unknown", `Unsupported command for terminal-attached session: ${type}`));
+          // Paseo's compatibility fallbacks match Pi's exact unknown-command error.
+          send(failure(id, type ?? "unknown", `Unknown command: ${type}`));
       }
     } catch (err) {
       debugLog(`command ${type} failed: ${String(err)}`);
@@ -465,10 +577,11 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
           debugLog("ignoring non-JSON line from client");
           continue;
         }
-        void handleCommand(parsed);
+        void handleCommand(parsed, socket);
       }
     });
     const detach = () => {
+      dropAsks(socket);
       if (client === socket) client = null;
       debugLog("client disconnected");
     };
@@ -486,6 +599,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
 
   function stopServer(): void {
     if (client) {
+      dropAsks(client);
       try {
         client.destroy();
       } catch {

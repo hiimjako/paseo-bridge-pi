@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
+import { once, EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import { sessionPaths, claimOwner, readOwner } from "../shim/session-owner.js";
@@ -137,11 +137,13 @@ test("positive dead-owner recovery and canonical symlink rendezvous", async () =
   assert.deepEqual(sessionPaths(alias), paths);
 });
 
-test("extension forwards settled boundaries/abort and native compacted edited projection over a real socket", async (t) => {
+test("extension forwards ask_user dialogs, settled boundaries and edited projection over a real socket", async (t) => {
   const { file, paths } = fixture("extension");
   const handlers = new Map();
   const prompts = [];
+  const events = new EventEmitter();
   const pi = {
+    events,
     on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
     registerCommand() {},
     sendUserMessage(...args) { prompts.push(args); },
@@ -154,15 +156,126 @@ test("extension forwards settled boundaries/abort and native compacted edited pr
   manager.appendCompaction("preserved summary", kept, 100);
   manager.appendContextEdit(kept, { content: "edited" });
   manager.branchWithSummary(manager.getLeafId(), "active branch summary");
+  let abortCalls = 0;
   const ctx = {
     mode: "tui", cwd: root, isIdle: () => true, ui: { notify() {} },
+    abort() { abortCalls++; },
     sessionManager: new Proxy(manager, { get(target, key) { return key === "getSessionFile" ? () => file : typeof target[key] === "function" ? target[key].bind(target) : target[key]; } }),
   };
   const emit = async (name, event) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
+  // Synthetic import + authenticated daemon endpoint; never attach a real session.
+  const daemon = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(daemon, "listening");
+  const target = `127.0.0.1:${daemon.address().port}`;
+  const token = randomBytes(32).toString("base64url");
+  fs.writeFileSync(path.join(process.env.PASEO_HOME, "paseo.pid"), JSON.stringify({ listen: target }));
+  fs.writeFileSync(path.join(process.env.PASEO_HOME, "local-credential"), token);
+  const cleanup = [];
+  daemon.on("connection", (ws) => ws.on("message", (data) => {
+    const frame = JSON.parse(String(data));
+    if (frame.type === "hello") {
+      assert.equal(frame.auth.token, token);
+      ws.send(JSON.stringify({ type: "session", message: { type: "status", payload: { status: "server_info", serverId: "test-daemon" } } }));
+      return;
+    }
+    const message = frame.message;
+    if (message?.type === "agent_permission_response") {
+      cleanup.push(message);
+      ws.send(JSON.stringify({ type: "session", message: { type: "agent_permission_resolved", payload: {
+        agentId: message.agentId, requestId: message.requestId, resolution: message.response,
+      } } }));
+    } else if (message?.requestId) {
+      ws.send(JSON.stringify({ type: "session", message: { type: "rpc_error", payload: {
+        requestId: message.requestId, error: "synthetic unsupported operation",
+      } } }));
+    }
+  }));
+  t.after(async () => {
+    for (const ws of daemon.clients) ws.terminate();
+    await new Promise((resolve) => daemon.close(resolve));
+    process.env.PI_PASEO_BRIDGE_NO_IMPORT = "1";
+    delete process.env.PASEO_CLI;
+  });
+  const cli = path.join(root, "fake-paseo");
+  fs.writeFileSync(cli, `#!${process.execPath}\nconsole.log('{"agentId":"test-agent"}')\n`, { mode: 0o700 });
+  process.env.PASEO_CLI = cli;
+  delete process.env.PI_PASEO_BRIDGE_NO_IMPORT;
+  let adopted;
+  const imported = new Promise((resolve) => { adopted = resolve; });
+  ctx.ui.notify = (message) => { if (message === "Session imported into Paseo") adopted(); };
   await emit("session_start", {});
+  await imported;
   const socket = net.connect(paths.socket);
   const next = lines(socket);
   await once(socket, "connect");
+  await next((line) => line.method === "notify"); // server has attached the controller
+  const answers = [];
+  const ask = (id) => {
+    const controller = new AbortController();
+    events.emit("ask-user:request", {
+      id, question: "Synthetic question", options: [
+        { label: "Same", description: "first" }, { label: "Same", description: "second" },
+      ], signal: controller.signal, respond: (response) => answers.push([id, response]),
+    });
+    return controller;
+  };
+  const reply = (id, fields) => socket.write(JSON.stringify({ type: "extension_ui_response", id, ...fields }) + "\n");
+  const barrier = async () => {
+    socket.write(JSON.stringify({ type: "get_state", id: "barrier" }) + "\n");
+    await next((line) => line.id === "barrier");
+  };
+  for (const custom of [false, true]) {
+    ask(`remote-${custom}`);
+    const select = await next((line) => line.method === "select");
+    assert.deepEqual(select.options, ["1. Same — first", "2. Same — second", "3. Write my own answer…"]);
+    reply("unknown", { value: select.options[0] });
+    reply(select.id, { value: 1 });
+    reply(select.id, { value: "Same" });
+    await barrier();
+    assert.equal(answers.length, custom ? 1 : 0);
+    reply(select.id, { value: select.options[custom ? 2 : 1] });
+    if (custom) {
+      const input = await next((line) => line.method === "input");
+      assert.notEqual(input.id, select.id);
+      reply(select.id, { cancelled: true });
+      reply(input.id, { value: "  custom text  " });
+      reply(input.id, { value: "duplicate" });
+    } else {
+      reply(select.id, { value: select.options[0] });
+    }
+    await barrier();
+  }
+  assert.deepEqual(answers, [["remote-false", { index: 2 }], ["remote-true", { text: "custom text" }]]);
+  ask("remote-cancel");
+  reply((await next((line) => line.method === "select")).id, { cancelled: true });
+  await barrier();
+  assert.deepEqual(answers.at(-1), ["remote-cancel", null]);
+  const waitCleanup = async (id) => {
+    const deadline = Date.now() + 2000;
+    while (!cleanup.some((message) => message.requestId === id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const message = cleanup.find((message) => message.requestId === id);
+    assert.ok(message, "native cleanup received");
+    assert.equal(message.agentId, "test-agent");
+    return message.response;
+  };
+  for (const response of [{ index: 2 }, { text: "local custom" }, null]) {
+    const controller = ask("local");
+    const select = await next((line) => line.method === "select");
+    events.emit("ask-user:resolved", { id: "local", response });
+    controller.abort();
+    reply(select.id, { value: select.options[0] });
+    assert.deepEqual(await waitCleanup(select.id), response === null ? { behavior: "deny" } : {
+      behavior: "allow", updatedInput: { answers: { Response: select.options["index" in response ? 1 : 2] } },
+    });
+  }
+  const aborted = ask("abort");
+  const abortCard = await next((line) => line.method === "select");
+  aborted.abort();
+  assert.deepEqual(await waitCleanup(abortCard.id), { behavior: "deny" });
+  await barrier();
+  assert.equal(answers.length, 3);
   await emit("agent_end", { type: "agent_end", messages: [] });
   assert.equal((await next((line) => line.type === "agent_end")).willRetry, false);
   // Paseo's documented compatibility boundary only completes agent_end with
@@ -181,8 +294,29 @@ test("extension forwards settled boundaries/abort and native compacted edited pr
   socket.write(JSON.stringify({ type: "prompt", id: "slash", message: "/example" }) + "\n");
   await next((line) => line.id === "slash");
   assert.equal(prompts[0][1].expandPromptTemplates, true);
+  await t.test("unsupported clear_queue allows Paseo's compatibility fallback to abort", async () => {
+    socket.write(JSON.stringify({ type: "clear_queue", id: "clear-before-abort" }) + "\n");
+    const cleared = await next((line) => line.id === "clear-before-abort");
+    // Paseo matches this exact Pi RPC error before continuing with abort.
+    assert.deepEqual(cleared, {
+      type: "response", id: "clear-before-abort", command: "clear_queue",
+      success: false, error: "Unknown command: clear_queue",
+    });
+    assert.equal(abortCalls, 0);
+    socket.write(JSON.stringify({ type: "abort", id: "abort-after-clear" }) + "\n");
+    assert.deepEqual(await next((line) => line.id === "abort-after-clear"), {
+      type: "response", id: "abort-after-clear", command: "abort", success: true,
+    });
+    assert.equal(abortCalls, 1);
+  });
+  ask("disconnect");
+  const disconnectedCard = await next((line) => line.method === "select");
   socket.destroy();
   await once(socket, "close");
+  assert.deepEqual(await waitCleanup(disconnectedCard.id), { behavior: "deny" });
+  events.emit("ask-user:resolved", { id: "disconnect", response: { index: 1 } });
+  ask("unattached");
+  assert.equal(answers.length, 3); // disconnect never dismisses the PC contender
   const attached = spawn(process.execPath, [shim, "--session", file], {
     env: { ...process.env, PI_REAL_BIN: fakePi }, stdio: ["pipe", "pipe", "pipe"],
   });
@@ -191,7 +325,12 @@ test("extension forwards settled boundaries/abort and native compacted edited pr
   const bridgeNext = lines(attached.stdout);
   attached.stdin.write(JSON.stringify({ type: "get_messages", id: "via-shim" }) + "\n");
   assert.equal((await bridgeNext((line) => line.id === "via-shim")).success, true);
+  ask("shutdown");
+  const shutdownCard = await bridgeNext((line) => line.method === "select");
+  attached.stdin.write(JSON.stringify({ type: "extension_ui_response", id: disconnectedCard.id, value: disconnectedCard.options[0] }) + "\n");
   await emit("session_shutdown", {});
+  assert.deepEqual(await waitCleanup(shutdownCard.id), { behavior: "deny" });
+  assert.equal(answers.length, 3);
   assert.match((await bridgeNext((line) => line.type === "process_exit")).error, /terminal pi session has ended/);
   attached.stdin.write(JSON.stringify({ type: "prompt", id: "after-close", message: "do not run" }) + "\n");
   assert.equal((await bridgeNext((line) => line.id === "after-close")).success, false);

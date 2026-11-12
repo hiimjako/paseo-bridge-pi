@@ -129,6 +129,9 @@ npm run dev-install    # registers the checkout's extension path + shim
 checkout by absolute path, so re-run it if you move the checkout. This is
 for development only — the supported install is the pi package flow above.
 
+After updating the extension, run `/reload` in each terminal Pi session when idle.
+Restarting Paseo alone does not reload a terminal-owned bridge.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -146,8 +149,16 @@ for development only — the supported install is the pi package flow above.
 
 ## Known limitations (v1)
 
-- Extension UI dialogs (`ask_user` etc.) render in the TUI only; they are not
-  forwarded to Paseo.
+- With the generic `ask_user` extension's `ask-user:request/resolved` events,
+  attached sessions also offer native Paseo choices and “Write my own answer…”
+  input. The PC popup stays usable; the first completed answer wins. Attachment
+  does not detect phone presence. Disconnect leaves the PC fallback available;
+  questions are not replayed after daemon restarts. Card cleanup is best effort.
+  Requires an event-enabled `ask_user` version; older versions and other
+  extension UI dialogs remain TUI-only.
+- Attached sessions cannot expose `clear_queue` through Pi's extension API. The
+  standard Pi unknown-command response lets Paseo use its abort compatibility
+  fallback; queued steering and follow-up messages are not cleared.
 - Timeline rewind from Paseo is rejected for terminal-attached sessions
   (use Fork instead).
 - Paseo's MCP tool injection (`pi-mcp-adapter`) does not apply to adopted
