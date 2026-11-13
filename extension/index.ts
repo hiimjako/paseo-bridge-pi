@@ -206,6 +206,9 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
   let releaseOwner: (() => void) | null = null;
   let latestCtx: ExtensionContext | null = null;
   let isCompacting = false;
+  const pendingAborts = new Set<{ id: unknown; socket: net.Socket; manualCompaction: boolean }>();
+  let manualCompaction = false;
+  let compactionIdleCheck: ReturnType<typeof setTimeout> | null = null;
   let autoCompactionEnabled = true;
   const importAttempted = new Set<string>();
   let currentAgentId: string | null = null;
@@ -434,6 +437,66 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     error,
   });
 
+  function clearCompactionIdleCheck(): void {
+    if (compactionIdleCheck) clearTimeout(compactionIdleCheck);
+    compactionIdleCheck = null;
+  }
+
+  function finishAborts(ctx: ExtensionContext, manualOnly = false, error?: string): void {
+    if (!error && !ctx.isIdle()) return;
+    for (const request of pendingAborts) {
+      if (manualOnly && !request.manualCompaction) continue;
+      pendingAborts.delete(request);
+      if (request.socket === client && !request.socket.destroyed) {
+        send(error ? failure(request.id, "abort", error) : success(request.id, "abort"));
+      }
+    }
+    if (pendingAborts.size === 0) clearCompactionIdleCheck();
+  }
+
+  function waitForManualCompactionIdle(ctx: ExtensionContext): void {
+    if (compactionIdleCheck || !manualCompaction) return;
+    // Pi clears manual compaction's busy flag only AFTER all success hooks
+    // return, with no later extension event. Do not poll agent/auto-compaction:
+    // those must forward agent_settled before ACK, even if already idle.
+    // Also clear completion state when no abort is pending, so it cannot be
+    // mistaken for a later run that is busy before agent_start.
+    const deadline = Date.now() + 5000;
+    const check = () => {
+      compactionIdleCheck = null;
+      if (!manualCompaction) return;
+      if (ctx.isIdle()) {
+        manualCompaction = false;
+        finishAborts(ctx, true);
+      } else if (Date.now() >= deadline) {
+        manualCompaction = false;
+        finishAborts(ctx, true, "Timed out waiting for manual compaction to become idle");
+      } else compactionIdleCheck = setTimeout(check, 25);
+    };
+    compactionIdleCheck = setTimeout(check, 25);
+  }
+
+  function handleAbort(id: unknown, socket: net.Socket): void {
+    if (socket !== client || socket.destroyed) return;
+    // ctx.abort() is void. Register before calling it, and never let another
+    // abort ACK overtake the terminal boundary an earlier request is awaiting.
+    const waitForBoundary = pendingAborts.size > 0 || (latestCtx && !latestCtx.isIdle());
+    const request = { id, socket, manualCompaction };
+    pendingAborts.add(request);
+    try {
+      latestCtx?.abort();
+    } catch (err) {
+      pendingAborts.delete(request);
+      throw err;
+    }
+    if (!waitForBoundary) {
+      pendingAborts.delete(request);
+      send(success(id, "abort"));
+    } else if (manualCompaction && !isCompacting && latestCtx) {
+      waitForManualCompactionIdle(latestCtx);
+    }
+  }
+
   function buildState(): Record<string, unknown> {
     const ctx = latestCtx;
     const sm = ctx?.sessionManager;
@@ -497,8 +560,7 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
           send(success(id, type));
           return;
         case "abort":
-          latestCtx?.abort();
-          send(success(id, type));
+          handleAbort(id, socket);
           return;
         case "get_state":
           send(success(id, type, buildState()));
@@ -582,6 +644,11 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     });
     const detach = () => {
       dropAsks(socket);
+      for (const request of pendingAborts) {
+        if (request.socket === socket) pendingAborts.delete(request);
+      }
+      // Compaction belongs to Pi, not the controller; keep its idle watcher
+      // across reconnects, without retaining the disconnected requests.
       if (client === socket) client = null;
       debugLog("client disconnected");
     };
@@ -598,6 +665,10 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
   }
 
   function stopServer(): void {
+    pendingAborts.clear();
+    clearCompactionIdleCheck();
+    isCompacting = false;
+    manualCompaction = false;
     if (client) {
       dropAsks(client);
       try {
@@ -818,9 +889,16 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
   for (const eventName of forwardEvents) {
     (pi as any).on(eventName, async (event: unknown, ctx: ExtensionContext) => {
       latestCtx = ctx;
+      if (eventName === "agent_start") {
+        manualCompaction = false;
+        clearCompactionIdleCheck();
+      }
       // Extension agent_end omits runtime willRetry. Its presence opts Paseo
       // into waiting for agent_settled, including retries and queued continuations.
       send(eventName === "agent_end" ? { ...(event as object), willRetry: false } : event);
+      // Paseo must consume the old run's terminal before an abort ACK lets it
+      // open a replacement turn. Settled handlers may then queue a new run.
+      if (eventName === "agent_settled") finishAborts(ctx);
     });
   }
 
@@ -885,18 +963,27 @@ export default function piPaseoBridge(pi: ExtensionAPI) {
     void maybeGenerateSessionTitle(ctx);
   });
 
-  pi.on("session_before_compact", async (_event, ctx) => {
+  pi.on("session_before_compact", async (event, ctx) => {
     latestCtx = ctx;
+    manualCompaction = (event as any).reason === "manual";
+    if (!manualCompaction) clearCompactionIdleCheck();
     isCompacting = true;
     send({ type: "compaction_start" });
     return undefined;
   });
 
-  pi.on("session_compact", async (event: any, ctx) => {
+  function compactionFinished(event: any, ctx: ExtensionContext): void {
     latestCtx = ctx;
     isCompacting = false;
-    send({ type: "compaction_end", ...(event?.entry ? { entry: event.entry } : {}) });
-  });
+    send({
+      type: "compaction_end",
+      ...(event?.entry ? { entry: event.entry } : {}),
+      ...(event?.type === "session_compact_failed" ? { aborted: event.aborted, errorMessage: event.errorMessage } : {}),
+    });
+    if (manualCompaction) waitForManualCompactionIdle(ctx);
+  }
+  pi.on("session_compact", compactionFinished);
+  (pi as any).on("session_compact_failed", compactionFinished);
 
   pi.on("model_select", async (event, ctx) => {
     latestCtx = ctx;

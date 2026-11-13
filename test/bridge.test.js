@@ -45,14 +45,16 @@ async function runShim(args) {
   const [code] = await once(child, "exit");
   return { code, output };
 }
-function lines(socket) {
+function lines(socket, onLine = () => {}) {
   const queue = [];
   let buffer = "";
   socket.on("data", (data) => {
     buffer += data;
     while (buffer.includes("\n")) {
       const index = buffer.indexOf("\n");
-      queue.push(JSON.parse(buffer.slice(0, index)));
+      const line = JSON.parse(buffer.slice(0, index));
+      queue.push(line);
+      onLine(line);
       buffer = buffer.slice(index + 1);
     }
   });
@@ -340,6 +342,274 @@ test("extension forwards ask_user dialogs, settled boundaries and edited project
   assert.equal((await runShim(["--session", file])).code, 1);
   await emit("session_start", {});
   await emit("session_shutdown", {});
+});
+
+test("abort ACK follows the terminal boundary and belongs only to its controller", async (t) => {
+  const { file, paths } = fixture("abort-settlement");
+  const handlers = new Map();
+  const prompts = [];
+  let idle = true;
+  let abortError;
+  let abortCalls = 0;
+  extension({
+    events: new EventEmitter(),
+    on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+    registerCommand() {},
+    getThinkingLevel() { return "off"; },
+    sendUserMessage(...args) { prompts.push(args); idle = false; },
+  });
+  const ctx = {
+    mode: "tui", cwd: root, isIdle: () => idle, ui: { notify() {} },
+    abort() { abortCalls++; if (abortError) throw abortError; },
+    hasPendingMessages: () => false, getContextUsage: () => undefined,
+    sessionManager: { getSessionFile: () => file, getEntries: () => [] },
+  };
+  const emit = async (type, fields = {}) => {
+    for (const handler of handlers.get(type) ?? []) await handler({ type, ...fields }, ctx);
+  };
+  let socket;
+  let next;
+  let wire;
+  const connect = async () => {
+    socket = net.connect(paths.socket);
+    wire = [];
+    next = lines(socket, (line) => wire.push(line));
+    await once(socket, "connect");
+    await next((line) => line.method === "notify");
+  };
+  const send = (type, id, fields = {}) => socket.write(JSON.stringify({ type, id, ...fields }) + "\n");
+  const barrier = async () => {
+    send("get_state", "barrier");
+    await next((line) => line.id === "barrier");
+  };
+  const noAck = (id) => assert.equal(wire.some((line) => line.id === id), false, `${id} must await the terminal boundary`);
+  const ack = async (id) => assert.deepEqual(await next((line) => line.id === id), {
+    type: "response", id, command: "abort", success: true,
+  });
+  t.after(async () => { socket?.destroy(); await emit("session_shutdown"); });
+  await emit("session_start");
+  await connect();
+
+  await t.test("busy and repeated aborts wait for forwarded agent_end AND agent_settled", async () => {
+    idle = false;
+    await emit("agent_start");
+    const before = abortCalls;
+    send("abort", "busy-1");
+    send("abort", "busy-2");
+    await barrier();
+    assert.equal(abortCalls, before + 2);
+    noAck("busy-1");
+    noAck("busy-2");
+    const messages = [{ role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" }];
+    await emit("agent_end", { messages });
+    await barrier();
+    noAck("busy-1");
+    noAck("busy-2");
+    assert.deepEqual((await next((line) => line.type === "agent_end")).messages, messages);
+    idle = true;
+    await emit("agent_settled", { aborted: true });
+    await ack("busy-1");
+    await ack("busy-2");
+    assert.deepEqual(wire.filter((line) => ["agent_end", "agent_settled"].includes(line.type) || line.command === "abort")
+      .map((line) => line.type === "response" ? line.id : line.type), ["agent_end", "agent_settled", "busy-1", "busy-2"]);
+
+    // A provider can now open its replacement: the old aborted terminal is
+    // already on the wire, and the new prompt is delivered without followUp.
+    send("prompt", "replacement", { message: "replacement message" });
+    assert.equal((await next((line) => line.id === "replacement")).success, true);
+    assert.deepEqual(prompts, [["replacement message", { expandPromptTemplates: true }]]);
+    await emit("agent_start");
+    const completed = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "replacement completed" }] }];
+    await emit("agent_end", { messages: completed });
+    idle = true;
+    await emit("agent_settled", { aborted: false });
+    const replacementEnd = await next((line) => line.type === "agent_end");
+    assert.deepEqual(replacementEnd.messages, completed);
+    await next((line) => line.type === "agent_settled" && !line.aborted);
+    assert.ok(wire.findIndex((line) => line.id === "replacement") > wire.findIndex((line) => line.id === "busy-2"));
+    assert.ok(wire.indexOf(replacementEnd) > wire.findIndex((line) => line.id === "replacement"));
+
+    idle = false;
+    await emit("agent_start");
+    const realError = [{ role: "assistant", stopReason: "error", errorMessage: "synthetic provider failure" }];
+    await emit("agent_end", { messages: realError });
+    idle = true;
+    await emit("agent_settled", { aborted: false });
+    assert.deepEqual((await next((line) => line.type === "agent_end")).messages, realError);
+    await next((line) => line.type === "agent_settled" && !line.aborted);
+  });
+
+  await t.test("idle abort and synchronous errors do not leave pending requests", async () => {
+    idle = true;
+    send("abort", "idle");
+    await ack("idle");
+    idle = false;
+    abortError = new Error("synthetic abort failure");
+    send("abort", "throws");
+    assert.deepEqual(await next((line) => line.id === "throws"), {
+      type: "response", id: "throws", command: "abort", success: false, error: "synthetic abort failure",
+    });
+    abortError = undefined;
+    idle = true;
+    await emit("agent_settled", { aborted: false });
+    await barrier();
+    assert.equal(wire.filter((line) => line.id === "throws").length, 1);
+  });
+
+  await t.test("manual compaction finishes without agent_settled; auto compaction still waits", async () => {
+    for (const reason of ["manual", "threshold"]) {
+      idle = false;
+      await emit("session_before_compact", { reason });
+      send("abort", reason);
+      await barrier();
+      noAck(reason);
+      // Failure hooks are already idle for manual compaction, not for auto.
+      idle = reason === "manual";
+      const failure = reason === "manual" ? { aborted: true } : { aborted: false, errorMessage: "synthetic compaction failure" };
+      await emit("session_compact_failed", { reason, ...failure });
+      const terminal = await next((line) => line.type === "compaction_end");
+      assert.deepEqual(terminal, { type: "compaction_end", ...failure });
+      if (reason === "threshold") {
+        await barrier();
+        noAck(reason);
+        idle = true;
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        await barrier();
+        noAck(reason); // idle alone must not overtake the automatic run's terminal
+        await emit("agent_settled", { aborted: true });
+      }
+      await ack(reason);
+      assert.ok(wire.indexOf(terminal) >= 0);
+      assert.ok(wire.indexOf(terminal) < wire.findIndex((line) => line.id === reason));
+    }
+    idle = false;
+    await emit("session_before_compact", { reason: "manual" });
+    send("abort", "manual-success");
+    await barrier();
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    handlers.get("session_compact").push(async () => { await held; idle = true; });
+    try {
+      const finishing = emit("session_compact", { reason: "manual" });
+      // A later extension hook can keep Pi busy across event-loop turns. One
+      // setImmediate check would miss this completion permanently.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await barrier();
+      noAck("manual-success");
+      release();
+      await finishing;
+      await ack("manual-success");
+    } finally {
+      release();
+      handlers.get("session_compact").pop();
+    }
+  });
+
+  await t.test("reconnecting during a manual success hook preserves completion but not stale ACKs", async () => {
+    idle = false;
+    await emit("session_before_compact", { reason: "manual" });
+    send("abort", "old-controller");
+    await barrier();
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    handlers.get("session_compact").push(async () => { await held; idle = true; });
+    try {
+      const finishing = emit("session_compact", { reason: "manual" });
+      await barrier();
+      noAck("old-controller");
+      socket.destroy();
+      await once(socket, "close");
+      await connect();
+      send("abort", "new-controller");
+      await barrier();
+      noAck("new-controller");
+      release();
+      await finishing;
+      await ack("new-controller");
+      await barrier();
+      noAck("old-controller");
+      assert.equal(wire.filter((line) => line.id === "new-controller").length, 1);
+    } finally {
+      release();
+      handlers.get("session_compact").pop();
+    }
+  });
+
+  await t.test("manual compaction deadline fails once instead of acknowledging busy Pi", async (st) => {
+    const now = Date.now;
+    let offset = 0;
+    st.mock.method(Date, "now", () => now() + offset);
+    idle = false;
+    await emit("session_before_compact", { reason: "manual" });
+    send("abort", "manual-timeout");
+    await barrier();
+    await emit("session_compact", { reason: "manual" });
+    await barrier();
+    noAck("manual-timeout");
+    offset = 6000;
+    assert.deepEqual(await next((line) => line.id === "manual-timeout"), {
+      type: "response", id: "manual-timeout", command: "abort", success: false,
+      error: "Timed out waiting for manual compaction to become idle",
+    });
+    idle = true;
+    await emit("agent_settled", { aborted: true });
+    await barrier();
+    assert.equal(wire.filter((line) => line.id === "manual-timeout").length, 1);
+  });
+
+  await t.test("manual completion without an abort cannot make a later run ACK before settled", async () => {
+    idle = false;
+    await emit("session_before_compact", { reason: "manual" });
+    await emit("session_compact", { reason: "manual" });
+    idle = true;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    // A new run can be busy before agent_start, e.g. in before_agent_start.
+    idle = false;
+    send("abort", "after-manual");
+    await barrier();
+    noAck("after-manual");
+    idle = true;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await barrier();
+    noAck("after-manual");
+    await emit("agent_settled", { aborted: true });
+    await ack("after-manual");
+  });
+
+  await t.test("disconnect and shutdown discard pending ACKs, including reused IDs", async () => {
+    idle = false;
+    send("abort", "stale");
+    await barrier();
+    noAck("stale");
+    socket.destroy();
+    await once(socket, "close");
+    await connect();
+    idle = true;
+    await emit("agent_settled", { aborted: true });
+    await barrier();
+    noAck("stale");
+    send("abort", "stale");
+    await ack("stale");
+    assert.equal(wire.filter((line) => line.id === "stale").length, 1);
+
+    idle = false;
+    await emit("session_before_compact", { reason: "manual" });
+    send("abort", "shutdown-pending");
+    await barrier();
+    await emit("session_compact_failed", { reason: "manual", aborted: true });
+    noAck("shutdown-pending");
+    const closed = once(socket, "close");
+    await emit("session_shutdown");
+    await closed;
+    await emit("session_start");
+    await connect();
+    idle = true;
+    await emit("agent_settled", { aborted: true });
+    await barrier();
+    noAck("shutdown-pending");
+    send("abort", "after-shutdown");
+    await ack("after-shutdown");
+  });
 });
 
 test("supported client authenticates using matching fresh credentials and refuses absent auth", async () => {

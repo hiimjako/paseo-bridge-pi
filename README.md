@@ -58,6 +58,27 @@ bundles it at `.../Paseo/resources/bin/paseo.cmd` on Windows).
 - Reopening a session in a terminal reattaches the existing Paseo agent
   instead of creating a duplicate.
 
+## Cancellation and steering
+
+For terminal-attached sessions, a successful abort response now follows the real
+`agent_settled` boundary, with the old turn's terminal events forwarded first.
+This prevents a late aborted turn from failing a replacement prompt in Paseo.
+Idle aborts return immediately; genuine provider errors and aborted messages are
+still forwarded, not hidden or converted into successful turns. Manual compaction
+has no settled event: after its completion hook the bridge checks idle every
+25 ms for up to 5 seconds, returning an explicit abort error if it stays busy.
+Automatic compaction still waits for `agent_settled`.
+
+**After updating, run `/reload` in every existing terminal Pi session when idle.**
+Restarting Paseo alone does not load this fix into an already-running TUI.
+
+Continuous steering of terminal-started autonomous runs remains an **upstream
+Paseo Pi-provider limitation**: Paseo may fall back from steer to interrupt/replace
+instead of sending a steer RPC. This patch makes that cancellation handshake safe;
+it does not add autonomous steering support or guarantee uninterrupted background
+continuations. Until the provider supports it, wait for the terminal run to become
+idle before sending a new mobile message when you need to avoid interrupting it.
+
 ## How it works
 
 Two components:
